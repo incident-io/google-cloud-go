@@ -19,6 +19,7 @@ import (
 	"errors"
 	"sync/atomic"
 
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -128,6 +129,11 @@ func (f *flowController) acquire(ctx context.Context, size int) error {
 	case FlowControlIgnore:
 		return nil
 	case FlowControlBlock:
+		// Add tracing around flow control so we know if we stalled due to our buffer being
+		// full.
+		ctx, span := otel.Tracer("pubsub_client").Start(ctx, "pubsub.flowController.acquire.block")
+		defer span.End()
+
 		if f.semCount != nil {
 			if err := f.semCount.Acquire(ctx, 1); err != nil {
 				return err
