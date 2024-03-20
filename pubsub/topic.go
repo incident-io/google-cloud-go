@@ -33,6 +33,9 @@ import (
 	gax "github.com/googleapis/gax-go/v2"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/api/support/bundler"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -752,7 +755,8 @@ func (t *Topic) Publish(ctx context.Context, msg *Message) *PublishResult {
 		ipubsub.SetPublishResult(r, "", err)
 		return r
 	}
-	err = t.scheduler.Add(msg.OrderingKey, &bundledMessage{msg, r, msgSize}, msgSize)
+
+	err = t.scheduler.Add(msg.OrderingKey, &bundledMessage{ctx, msg, r, msgSize}, msgSize)
 	if err != nil {
 		t.scheduler.Pause(msg.OrderingKey)
 		ipubsub.SetPublishResult(r, "", err)
@@ -783,9 +787,10 @@ func (t *Topic) Flush() {
 }
 
 type bundledMessage struct {
-	msg  *Message
-	res  *PublishResult
-	size int
+	publish context.Context
+	msg     *Message
+	res     *PublishResult
+	size    int
 }
 
 func (t *Topic) initBundler() {
@@ -873,6 +878,83 @@ func (t *Topic) publishMessageBundle(ctx context.Context, bms []*bundledMessage)
 	if err != nil {
 		log.Printf("pubsub: cannot create context with tag in publishMessageBundle: %v", err)
 	}
+
+	// We have to do some weird things to instrument this batcher to get around
+	// OpenTelemetry limitations, namely that you can't add span links after you've created
+	// your span.
+	//
+	// Ideally we would trace our batch publishing separately from the publishing spans
+	// here, but attach a link between our spans and the publishing span so you can jump
+	// into the batch if you see issues on the publish. But we can't do this as the publish
+	// spans are unable to add links after they've been created.
+	//
+	// Instead, we're forced to:
+	// - Create a span for our batch publishing that instruments this method with links back
+	// to the original publishing spans.
+	//
+	// Most trace tools can't reverse-traverse links (go from parent to the child if only
+	// the child has the link) which prevents us from jumping app trace into batch trace,
+	// which is the direction we want to enable.
+	//
+	// So we also:
+	// - Create a span for each of the batched messages inside their parent trace that
+	// represents the batch, created with a single link to our functions batch span.
+	//
+	// That means we're creating N 'batch' traces just for the sake of linking, but should
+	// provide the experience we want.
+	totalBundleSize := 0
+	opts := []trace.SpanStartOption{
+		trace.WithSpanKind(trace.SpanKindProducer),
+	}
+	for _, bm := range bms {
+		totalBundleSize += bm.size
+
+		if bm.publish == nil {
+			continue
+		}
+
+		// These options will be used to create our functions span, which is the main
+		// representation of the batch publish.
+		//
+		// We must build a list of all original publishing spans so we can set them as links
+		// on our span.
+		opts = append(opts, trace.WithLinks(trace.LinkFromContext(bm.publish, attribute.KeyValue(
+			attribute.String("reason", "original publishing span"),
+		))))
+	}
+
+	// Create a trace separate from the publish parents to represent the actual batch
+	// publish. This will track the gRPC calls and any downstream activity, as it's what we
+	// override the context with for the duration of this function.
+	tp := otel.GetTracerProvider().Tracer("pubsub_client")
+	ctx, span := tp.Start(ctx, "pubsub.Topic.publishMessageBundle", append(opts, trace.WithAttributes(
+		attribute.Int("message_count", len(bms)),
+		attribute.Int("message_bundle_size", totalBundleSize),
+	))...)
+	defer span.End()
+
+	// For each of the batched messages, create a span that tracks the publish and links to
+	// the cannonical publish span.
+	for _, bm := range bms {
+		if bm.publish == nil {
+			continue
+		}
+
+		// Dummy bundle span which is primarily for linking from the publish traces into our
+		// context, the batcher.
+		_, span := tp.Start(bm.publish, "bundle", trace.WithLinks(trace.LinkFromContext(
+			ctx, attribute.KeyValue(
+				attribute.String("reason", "batch publish span"),
+			),
+		)))
+		defer span.End()
+
+		span.SetAttributes(
+			attribute.Int("message_count", len(bms)),
+			attribute.Int("message_size", bm.size),
+		)
+	}
+
 	pbMsgs := make([]*pb.PubsubMessage, len(bms))
 	var orderingKey string
 	for i, bm := range bms {
