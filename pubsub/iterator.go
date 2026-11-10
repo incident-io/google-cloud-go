@@ -470,7 +470,9 @@ func (it *messageIterator) sender() {
 		sendPing := false
 		sendReceipt := false
 
-		dl := it.ackDeadline()
+		// The deadline is only needed when sending modacks, and working it out walks the
+		// whole ack time distribution, so don't do it on every pass of this loop.
+		var dl time.Duration
 
 		select {
 		case <-it.failed:
@@ -487,6 +489,7 @@ func (it *messageIterator) sender() {
 			done = true
 
 		case <-it.kaTick:
+			dl = it.ackDeadline()
 			it.mu.Lock()
 			it.handleKeepAlives()
 			sendModAcks = (len(it.pendingModAcks) > 0)
@@ -549,7 +552,7 @@ func (it *messageIterator) sender() {
 			it.pingStream()
 		}
 		if sendReceipt {
-			it.sendModAck(receipts, dl, true, true)
+			it.sendModAck(receipts, it.ackDeadline(), true, true)
 		}
 	}
 }
